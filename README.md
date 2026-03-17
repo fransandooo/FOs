@@ -22,7 +22,7 @@ Build a minimal OS from the ground up, phase by phase, culminating in running [d
 
 - **Emulator**: QEMU (x86_64)
 - **Toolchain**: x86_64-elf-gcc (cross-compiler)
-- **Bootloader**: GRUB with Multiboot2
+- **Bootloader**: Custom (written from scratch)
 - **Target arch**: x86-64 (64-bit long mode)
 
 ## Resources
