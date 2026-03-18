@@ -5,6 +5,10 @@
 #include "pmm.h"
 #include "vmm.h"
 #include "heap.h"
+#include "pic.h"
+#include "idt.h"
+#include "pit.h"
+#include "keyboard.h"
 #include "string.h"
 #include <stdint.h>
 
@@ -27,118 +31,95 @@ static void e820_print(void) {
     kprintf("\n");
 }
 
-static void test_pmm(void) {
-    kprintf("--- PMM Tests ---\n");
+static void shell_loop(void) {
+    kprintf("FOs> ");
 
-    void *p1 = pmm_alloc_page();
-    void *p2 = pmm_alloc_page();
-    void *p3 = pmm_alloc_page();
-    kprintf("Alloc 3 pages: %p %p %p\n", p1, p2, p3);
+    char line[256];
+    int pos = 0;
 
-    /* Free p2, then alloc again — should reuse p2's slot */
-    pmm_free_page(p2);
-    void *p4 = pmm_alloc_page();
-    kprintf("Free p2, re-alloc: %p (expect %p) %s\n",
-            p4, p2, p4 == p2 ? "PASS" : "FAIL");
+    for (;;) {
+        char c = keyboard_getchar();
+        if (!c) {
+            __asm__ volatile ("hlt");
+            continue;
+        }
 
-    /* Clean up */
-    pmm_free_page(p1);
-    pmm_free_page(p3);
-    pmm_free_page(p4);
+        if (c == '\n') {
+            tty_putchar('\n');
+            line[pos] = '\0';
 
-    kprintf("PMM: %llu pages free after cleanup\n\n", pmm_free_pages());
-}
+            if (pos > 0) {
+                if (strcmp(line, "help") == 0) {
+                    kprintf("Commands: help, ticks, mem, clear\n");
+                } else if (strcmp(line, "ticks") == 0) {
+                    uint64_t t = pit_get_ticks();
+                    kprintf("Ticks: %llu (uptime: %llus)\n", t, t / 100);
+                } else if (strcmp(line, "mem") == 0) {
+                    kprintf("Free: %llu MB (%llu pages)\n",
+                            pmm_free_pages() * 4096 / (1024 * 1024),
+                            pmm_free_pages());
+                } else if (strcmp(line, "clear") == 0) {
+                    tty_clear();
+                } else {
+                    kprintf("Unknown command: %s\n", line);
+                }
+            }
 
-static void test_heap(void) {
-    kprintf("--- Heap Tests ---\n");
-
-    /* Basic alloc */
-    void *a = kmalloc(64);
-    void *b = kmalloc(128);
-    void *c = kmalloc(32);
-    kprintf("Alloc: a=%p b=%p c=%p\n", a, b, c);
-
-    /* Write and verify (catches mapping/corruption issues) */
-    memset(a, 0xAA, 64);
-    memset(b, 0xBB, 128);
-    memset(c, 0xCC, 32);
-    kprintf("Write: a[0]=0x%x b[0]=0x%x c[0]=0x%x ",
-            *(uint8_t *)a, *(uint8_t *)b, *(uint8_t *)c);
-    kprintf("%s\n",
-            (*(uint8_t *)a == 0xAA && *(uint8_t *)b == 0xBB &&
-             *(uint8_t *)c == 0xCC) ? "PASS" : "FAIL");
-
-    /* Free and reuse — b's slot should be reused */
-    kfree(b);
-    void *d = kmalloc(100);
-    kprintf("Reuse: d=%p (was b=%p) %s\n",
-            d, b, d == b ? "PASS" : "NEAR");
-
-    /* Coalescing — free adjacent blocks, then alloc a larger one */
-    kfree(a);
-    kfree(d);
-    void *big = kmalloc(200);
-    kprintf("Coalesce: big=%p %s\n", big, big ? "PASS" : "FAIL");
-    kfree(big);
-    kfree(c);
-
-    /* Stress test */
-    kprintf("Stress test (100 allocs, interleaved frees)... ");
-    void *ptrs[100];
-    int ok = 1;
-    for (int i = 0; i < 100; i++) {
-        ptrs[i] = kmalloc(i * 8 + 8);
-        if (!ptrs[i]) { ok = 0; break; }
+            kprintf("FOs> ");
+            pos = 0;
+        } else if (c == '\b') {
+            if (pos > 0) {
+                pos--;
+                tty_putchar('\b');
+            }
+        } else if (pos < 255) {
+            line[pos++] = c;
+            tty_putchar(c);
+        }
     }
-    for (int i = 0; i < 100; i += 2)
-        kfree(ptrs[i]);
-    for (int i = 0; i < 50; i++) {
-        ptrs[i] = kmalloc(16);
-        if (!ptrs[i]) { ok = 0; break; }
-    }
-    /* Free everything */
-    for (int i = 0; i < 50; i++)
-        kfree(ptrs[i]);
-    for (int i = 1; i < 100; i += 2)
-        kfree(ptrs[i]);
-    kprintf("%s\n\n", ok ? "PASS" : "FAIL");
 }
 
 void kmain(void) {
-    /* 1. Debug output first — always */
+    /* 1. Output first */
     serial_init();
     tty_init();
 
     kprintf("========================================\n");
-    kprintf("  FOs - Phase 2: Memory Management\n");
+    kprintf("  FOs - Phase 3: Interrupts & Shell\n");
     kprintf("========================================\n\n");
 
-    /* 2. Print E820 memory map (populated by Stage 2) */
+    /* 2. Memory map */
     e820_print();
 
-    /* 3. Physical Memory Manager — needs E820 */
+    /* 3. Memory management (from Phase 2) */
     pmm_init();
-
-    /* 4. Virtual Memory Manager — needs PMM to allocate page tables */
     vmm_init();
-
-    /* 5. Kernel Heap — needs PMM (uses identity-mapped pages) */
     heap_init();
 
-    kprintf("\n");
+    /* 4. Interrupts — ORDER MATTERS:
+     *    Remap PIC → Load IDT → Configure devices → sti
+     *    Doing sti before IDT is loaded = instant triple fault */
+    pic_remap();
+    idt_init();
+    pit_init(100);       /* 100 Hz timer (10ms per tick) */
+    keyboard_init();
 
-    /* 6. Run tests */
-    test_pmm();
-    test_heap();
+    /* Unmask timer and keyboard IRQs */
+    pic_unmask_irq(0);   /* IRQ0 = PIT timer */
+    pic_unmask_irq(1);   /* IRQ1 = PS/2 keyboard */
 
-    /* Summary */
-    kprintf("========================================\n");
-    kprintf("  Phase 2 complete\n");
-    kprintf("  Free: %llu MB (%llu pages)\n",
-            pmm_free_pages() * PAGE_SIZE / (1024 * 1024),
-            pmm_free_pages());
-    kprintf("========================================\n");
+    /* Enable interrupts — everything fires from here */
+    __asm__ volatile ("sti");
 
-    for (;;)
-        __asm__ volatile ("hlt");
+    kprintf("\nInterrupts enabled. Timer: 100Hz, Keyboard: PS/2\n");
+
+    /* Quick timer sanity check */
+    uint64_t t0 = pit_get_ticks();
+    pit_sleep_ms(100);
+    uint64_t t1 = pit_get_ticks();
+    kprintf("Timer test: %llu ticks in ~100ms %s\n\n",
+            t1 - t0, (t1 - t0 >= 8 && t1 - t0 <= 12) ? "PASS" : "CHECK");
+
+    /* Interactive shell */
+    shell_loop();
 }

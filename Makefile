@@ -32,9 +32,11 @@ KERNEL_MAX_BYTES   = $(shell echo $$(($(KERNEL_MAX_SECTORS) * 512)))
 
 # Source files
 KERNEL_C   = kernel/kmain.c kernel/tty.c kernel/serial.c kernel/string.c \
-             kernel/kprintf.c kernel/pmm.c kernel/vmm.c kernel/heap.c
-KERNEL_ASM = kernel/entry.asm
-KERNEL_OBJ = kernel/entry.o $(KERNEL_C:.c=.o)
+             kernel/kprintf.c kernel/pmm.c kernel/vmm.c kernel/heap.c \
+             kernel/pic.c kernel/idt.c kernel/isr.c kernel/pit.c \
+             kernel/keyboard.c
+KERNEL_ASM = kernel/entry.asm kernel/isr_stubs.asm
+KERNEL_OBJ = kernel/entry.o kernel/isr_stubs.o $(KERNEL_C:.c=.o)
 
 # =============================================================================
 # Targets
@@ -55,6 +57,9 @@ boot/stage2.bin: boot/stage2.asm
 # --- Kernel (compiled to ELF, then converted to flat binary) ---
 
 kernel/entry.o: kernel/entry.asm
+	$(NASM) $(NASMFLAGS_ELF) -o $@ $<
+
+kernel/isr_stubs.o: kernel/isr_stubs.asm
 	$(NASM) $(NASMFLAGS_ELF) -o $@ $<
 
 kernel/%.o: kernel/%.c

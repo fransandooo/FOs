@@ -1,5 +1,6 @@
 #include "tty.h"
 #include "serial.h"
+#include "io.h"
 #include <stdint.h>
 
 /*
@@ -29,6 +30,15 @@ static uint16_t make_entry(char c, uint8_t color) {
     return (uint16_t)c | ((uint16_t)color << 8);
 }
 
+/* Update the hardware cursor position via VGA CRT controller */
+static void update_cursor(void) {
+    uint16_t pos = row * VGA_WIDTH + col;
+    outb(0x3D4, 0x0F);
+    outb(0x3D5, (uint8_t)(pos & 0xFF));
+    outb(0x3D4, 0x0E);
+    outb(0x3D5, (uint8_t)((pos >> 8) & 0xFF));
+}
+
 /* Scroll the screen up by one line */
 static void scroll(void) {
     /* Move all rows up by one */
@@ -50,6 +60,11 @@ void tty_putchar(char c) {
         row++;
     } else if (c == '\r') {
         col = 0;
+    } else if (c == '\b') {
+        if (col > 0) {
+            col--;
+            vga[row * VGA_WIDTH + col] = make_entry(' ', VGA_COLOR);
+        }
     } else if (c == '\t') {
         col = (col + 8) & ~7;   /* Align to next 8-column boundary */
     } else {
@@ -68,6 +83,8 @@ void tty_putchar(char c) {
         scroll();
         row = VGA_HEIGHT - 1;
     }
+
+    update_cursor();
 }
 
 void tty_print(const char *str) {
@@ -75,11 +92,15 @@ void tty_print(const char *str) {
         tty_putchar(*str++);
 }
 
-void tty_init(void) {
-    /* Clear the entire screen */
+void tty_clear(void) {
     for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) {
         vga[i] = make_entry(' ', VGA_COLOR);
     }
     col = 0;
     row = 0;
+    update_cursor();
+}
+
+void tty_init(void) {
+    tty_clear();
 }
