@@ -18,15 +18,21 @@ NASM     = nasm
 # -fno-pie -no-pie  : Absolute addresses, not position-independent
 # -fno-exceptions   : No C++ exceptions
 CFLAGS   = -ffreestanding -O2 -Wall -Wextra -Werror \
-           -mno-red-zone -fno-stack-protector -fno-pie -no-pie \
+           -mno-red-zone -mno-sse -mno-sse2 -mno-mmx \
+           -fno-stack-protector -fno-pie -no-pie \
            -fno-exceptions -m64
 
 LDFLAGS  = -nostdlib -T linker.ld
 NASMFLAGS_BIN = -f bin
 NASMFLAGS_ELF = -f elf64
 
+# Maximum kernel size the bootloader can handle (must match stage2.asm)
+KERNEL_MAX_SECTORS = 128
+KERNEL_MAX_BYTES   = $(shell echo $$(($(KERNEL_MAX_SECTORS) * 512)))
+
 # Source files
-KERNEL_C   = kernel/kmain.c kernel/tty.c kernel/serial.c kernel/string.c
+KERNEL_C   = kernel/kmain.c kernel/tty.c kernel/serial.c kernel/string.c \
+             kernel/kprintf.c kernel/pmm.c kernel/vmm.c kernel/heap.c
 KERNEL_ASM = kernel/entry.asm
 KERNEL_OBJ = kernel/entry.o $(KERNEL_C:.c=.o)
 
@@ -34,7 +40,7 @@ KERNEL_OBJ = kernel/entry.o $(KERNEL_C:.c=.o)
 # Targets
 # =============================================================================
 
-.PHONY: all run debug clean
+.PHONY: all run run-serial run-debug debug clean
 
 all: fos.img
 
@@ -59,19 +65,27 @@ kernel.elf: $(KERNEL_OBJ) linker.ld
 
 kernel.bin: kernel.elf
 	$(OBJCOPY) -O binary $< $@
+	@KSIZE=$$(wc -c < $@); \
+	if [ $$KSIZE -gt $(KERNEL_MAX_BYTES) ]; then \
+		echo "ERROR: kernel.bin ($$KSIZE bytes) exceeds bootloader limit ($(KERNEL_MAX_BYTES) bytes / $(KERNEL_MAX_SECTORS) sectors)"; \
+		echo "       Increase KERNEL_LOAD_SECTORS in stage2.asm and KERNEL_MAX_SECTORS in Makefile"; \
+		rm -f $@; \
+		exit 1; \
+	fi
+	@echo "  kernel.bin: $$(wc -c < $@) / $(KERNEL_MAX_BYTES) bytes"
 
 # --- Disk image ---
 # Layout:
 #   Sector  0      : Stage 1 (MBR, 512 bytes)
 #   Sectors 1-16   : Stage 2 (8KB)
-#   Sectors 17+    : Kernel (flat binary)
+#   Sectors 17+    : Kernel (flat binary, up to KERNEL_MAX_SECTORS sectors)
 
 fos.img: boot/stage1.bin boot/stage2.bin kernel.bin
 	dd if=/dev/zero of=$@ bs=512 count=2880 2>/dev/null
 	dd if=boot/stage1.bin of=$@ conv=notrunc 2>/dev/null
 	dd if=boot/stage2.bin of=$@ bs=512 seek=1 conv=notrunc 2>/dev/null
 	dd if=kernel.bin of=$@ bs=512 seek=17 conv=notrunc 2>/dev/null
-	@echo "==> fos.img created ($(shell wc -c < kernel.bin 2>/dev/null || echo '?') byte kernel)"
+	@echo "==> fos.img ready"
 
 # --- Run in QEMU ---
 

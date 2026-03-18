@@ -5,13 +5,14 @@
 ;
 ; Responsibilities (in order):
 ;   1. Load kernel from disk to temporary address (0x10000)
-;   2. Enable the A20 line (access memory above 1MB)
+;   2. Detect memory map via E820 BIOS call
 ;   3. Check that CPU supports long mode (CPUID)
-;   4. Switch to 32-bit protected mode
-;   5. Copy kernel to final address (0x100000 = 1MB mark)
-;   6. Set up identity-mapped page tables
-;   7. Switch to 64-bit long mode
-;   8. Jump to kernel
+;   4. Enable the A20 line (access memory above 1MB)
+;   5. Switch to 32-bit protected mode
+;   6. Copy kernel to final address (0x100000 = 1MB mark)
+;   7. Set up identity-mapped page tables
+;   8. Switch to 64-bit long mode
+;   9. Jump to kernel
 ;
 ; Memory map during boot:
 ;   0x00000 - 0x004FF : BIOS data area (IVT, BDA)
@@ -19,16 +20,31 @@
 ;   0x01000 - 0x01FFF : PML4 (page table level 4)
 ;   0x02000 - 0x02FFF : PDPT (page directory pointer table)
 ;   0x03000 - 0x03FFF : PD   (page directory)
-;   0x04000 - 0x07BFF : Free (stack grows down from 0x7C00)
+;   0x04000 - 0x04FFF : Free
+;   0x04FF0 - 0x04FF7 : E820 entry count (uint16_t at 0x4FF8)
+;   0x05000 - 0x05FFF : E820 memory map entries (24 bytes each)
 ;   0x07C00 - 0x07DFF : Stage 1 (MBR)
-;   0x07E00 - 0x09FFF : Stage 2 (this code)
-;   0x10000 - 0x1FFFF : Kernel (temporary load address)
+;   0x07E00 - 0x09DFF : Stage 2 (this code, 8KB)
+;   0x10000 - 0x1FFFF : Kernel (temporary load, up to 64KB)
 ;   0xB8000 - 0xB8FFF : VGA text buffer
 ;   0x100000+         : Kernel (final address after copy)
 ; =============================================================================
 
 [BITS 16]
 [ORG 0x7E00]
+
+; =============================================================================
+; Constants
+; =============================================================================
+KERNEL_LOAD_SEG     equ 0x1000      ; Segment for temp kernel load (phys 0x10000)
+KERNEL_LOAD_SECTORS equ 128         ; Max sectors to load (128 * 512 = 64KB)
+KERNEL_DISK_LBA     equ 17          ; Kernel starts at sector 17
+KERNEL_FINAL_ADDR   equ 0x100000    ; Final kernel address (1MB)
+KERNEL_COPY_DWORDS  equ (KERNEL_LOAD_SECTORS * 512) / 4
+
+E820_MAP_ADDR       equ 0x5000      ; Where E820 entries are stored
+E820_COUNT_ADDR     equ 0x4FF8      ; Where E820 entry count is stored
+E820_MAGIC          equ 0x534D4150  ; 'SMAP'
 
 stage2_entry:
     ; Save boot drive number (passed in DL from Stage 1)
@@ -57,7 +73,7 @@ stage2_entry:
 
     mov si, msg_ok
     call print16
-    jmp check_long_mode
+    jmp detect_e820
 
 load_failed:
     mov si, msg_disk_err
@@ -65,7 +81,57 @@ load_failed:
     jmp halt16
 
     ; =====================================================================
-    ; Step 2: Verify long mode support via CPUID
+    ; Step 2: Detect memory map via E820
+    ; =====================================================================
+    ; Must happen in real mode (uses BIOS int 0x15).
+    ; Stores entries at E820_MAP_ADDR, count at E820_COUNT_ADDR.
+    ; Each entry: base(8) + length(8) + type(4) + acpi_attrs(4) = 24 bytes
+    ; =====================================================================
+detect_e820:
+    mov si, msg_e820
+    call print16
+
+    xor ebx, ebx                ; Continuation value (0 = first call)
+    mov di, E820_MAP_ADDR       ; ES:DI → buffer for entries
+    xor bp, bp                  ; Entry count
+
+.e820_loop:
+    mov eax, 0xE820
+    mov ecx, 24                 ; Request 24-byte entries (ACPI 3.0)
+    mov edx, E820_MAGIC         ; 'SMAP' signature
+    int 0x15
+
+    jc .e820_done               ; Carry = error or end of list
+    cmp eax, E820_MAGIC         ; EAX must echo 'SMAP' on success
+    jne .e820_fail
+
+    cmp ecx, 20                 ; Entry must be at least 20 bytes
+    jl .e820_skip
+
+    inc bp                      ; Count this valid entry
+    add di, 24                  ; Advance to next slot
+
+.e820_skip:
+    test ebx, ebx              ; EBX = 0 means this was the last entry
+    jz .e820_done
+    jmp .e820_loop
+
+.e820_fail:
+    mov si, msg_e820_fail
+    call print16
+    jmp halt16
+
+.e820_done:
+    test bp, bp                 ; Did we get any entries?
+    jz .e820_fail               ; No entries = failure
+
+    mov [E820_COUNT_ADDR], bp   ; Store entry count
+    mov si, msg_ok
+    call print16
+    jmp check_long_mode
+
+    ; =====================================================================
+    ; Step 3: Verify long mode support via CPUID
     ; =====================================================================
 check_long_mode:
     ; First check if CPUID instruction is available
@@ -110,7 +176,7 @@ no_long_mode:
     jmp halt16
 
     ; =====================================================================
-    ; Step 3: Enable A20 line
+    ; Step 4: Enable A20 line
     ; =====================================================================
 enable_a20:
     ; Try BIOS method first (int 0x15, AX=0x2401)
@@ -131,7 +197,7 @@ a20_done:
     call print16
 
     ; =====================================================================
-    ; Step 4: Enter 32-bit protected mode
+    ; Step 5: Enter 32-bit protected mode
     ; =====================================================================
     cli                         ; Disable interrupts for mode switch
     lgdt [gdt32_ptr]            ; Load 32-bit GDT
@@ -171,20 +237,22 @@ halt16:
 ; =============================================================================
 boot_drive:     db 0
 
-; DAP for loading kernel (64 sectors = 32KB at LBA 17)
+; DAP for loading kernel (128 sectors = 64KB at LBA 17)
 kernel_dap:
     db 0x10                     ; DAP size
     db 0x00                     ; Reserved
-    dw 64                       ; Sectors to read (32KB)
-    dw 0x0000                   ; Offset  (0x1000:0x0000 = physical 0x10000)
-    dw 0x1000                   ; Segment
-    dq 17                       ; Start LBA (sectors 17+)
+    dw KERNEL_LOAD_SECTORS      ; Sectors to read
+    dw 0x0000                   ; Offset  (KERNEL_LOAD_SEG:0x0000 = physical 0x10000)
+    dw KERNEL_LOAD_SEG          ; Segment
+    dq KERNEL_DISK_LBA          ; Start LBA
 
 ; Messages
 msg_stage2:     db "[FOs] Stage 2 bootloader", 13, 10, 0
 msg_loading:    db "  Loading kernel... ", 0
 msg_ok:         db "OK", 13, 10, 0
 msg_disk_err:   db "DISK ERROR", 13, 10, 0
+msg_e820:       db "  E820 memory map... ", 0
+msg_e820_fail:  db "E820 FAILED", 13, 10, 0
 msg_no_cpuid:   db "ERROR: No CPUID support", 13, 10, 0
 msg_no_lm:      db "ERROR: CPU lacks long mode", 13, 10, 0
 msg_lm_ok:      db "  Long mode: supported", 13, 10, 0
@@ -239,16 +307,16 @@ protected_mode_entry:
     out dx, al
 
     ; =====================================================================
-    ; Step 5: Copy kernel from 0x10000 to 0x100000 (1MB)
+    ; Step 6: Copy kernel from 0x10000 to 0x100000 (1MB)
     ; =====================================================================
     cld
     mov esi, 0x10000            ; Source: temporary load address
-    mov edi, 0x100000           ; Destination: 1MB mark
-    mov ecx, 32768 / 4         ; 32KB / 4 = 8192 dwords
+    mov edi, KERNEL_FINAL_ADDR  ; Destination: 1MB mark
+    mov ecx, KERNEL_COPY_DWORDS
     rep movsd
 
     ; =====================================================================
-    ; Step 6: Set up identity-mapped page tables
+    ; Step 7: Set up identity-mapped page tables
     ; =====================================================================
     ; We need 4-level paging for long mode:
     ;   PML4 (at 0x1000) → PDPT (at 0x2000) → PD (at 0x3000)
@@ -279,7 +347,7 @@ protected_mode_entry:
     mov dword [0x300C], 0x00000000
 
     ; =====================================================================
-    ; Step 7: Enable long mode and paging
+    ; Step 8: Enable long mode and paging
     ; =====================================================================
 
     ; Load PML4 base address into CR3
@@ -361,9 +429,9 @@ long_mode_entry:
     out dx, al
 
     ; =====================================================================
-    ; Step 8: Jump to kernel at 0x100000
+    ; Step 9: Jump to kernel at 0x100000
     ; =====================================================================
-    mov rax, 0x100000
+    mov rax, KERNEL_FINAL_ADDR
     jmp rax
 
 ; Pad stage2 to exactly 8KB (16 sectors) so disk layout is predictable
