@@ -8,11 +8,12 @@
 ;   2. Detect memory map via E820 BIOS call
 ;   3. Check that CPU supports long mode (CPUID)
 ;   4. Enable the A20 line (access memory above 1MB)
-;   5. Switch to 32-bit protected mode
-;   6. Copy kernel to final address (0x100000 = 1MB mark)
-;   7. Set up identity-mapped page tables
-;   8. Switch to 64-bit long mode
-;   9. Jump to kernel
+;   5. Set VBE graphics mode (linear framebuffer)
+;   6. Switch to 32-bit protected mode
+;   7. Copy kernel to final address (0x100000 = 1MB mark)
+;   8. Set up identity-mapped page tables
+;   9. Switch to 64-bit long mode
+;  10. Jump to kernel
 ;
 ; Memory map during boot:
 ;   0x00000 - 0x004FF : BIOS data area (IVT, BDA)
@@ -23,6 +24,9 @@
 ;   0x04000 - 0x04FFF : Free
 ;   0x04FF0 - 0x04FF7 : E820 entry count (uint16_t at 0x4FF8)
 ;   0x05000 - 0x05FFF : E820 memory map entries (24 bytes each)
+;   0x05FF0 - 0x05FF1 : VBE magic word (0x1EAF = success)
+;   0x06000 - 0x060FF : VBE mode info block (256 bytes)
+;   0x07000 - 0x071FF : VBE controller info (temp, 512 bytes)
 ;   0x07C00 - 0x07DFF : Stage 1 (MBR)
 ;   0x07E00 - 0x09DFF : Stage 2 (this code, 8KB)
 ;   0x10000 - 0x1FFFF : Kernel (temporary load, up to 64KB)
@@ -45,6 +49,10 @@ KERNEL_COPY_DWORDS  equ (KERNEL_LOAD_SECTORS * 512) / 4
 E820_MAP_ADDR       equ 0x5000      ; Where E820 entries are stored
 E820_COUNT_ADDR     equ 0x4FF8      ; Where E820 entry count is stored
 E820_MAGIC          equ 0x534D4150  ; 'SMAP'
+
+VBE_INFO_ADDR       equ 0x6000      ; Where VBE mode info is stored (256 bytes)
+VBE_MAGIC_ADDR      equ 0x5FF0      ; Magic word: 0x1EAF = VBE success
+VBE_CTRL_ADDR       equ 0x7000      ; Temp buffer for VBE controller info
 
 stage2_entry:
     ; Save boot drive number (passed in DL from Stage 1)
@@ -197,7 +205,139 @@ a20_done:
     call print16
 
     ; =====================================================================
-    ; Step 5: Enter 32-bit protected mode
+    ; Step 5: Set VBE graphics mode
+    ; =====================================================================
+    ; Must happen in real mode (uses BIOS int 0x10).
+    ; We query mode info first (to get framebuffer address), then set mode.
+    ; Done LAST before protected mode so all BIOS text output is finished.
+    ;
+    ; Try modes in preference order: 1024x768, 800x600, 640x480.
+    ; We check each mode's info for 32bpp + linear framebuffer support.
+    ; =====================================================================
+vbe_setup:
+    mov si, msg_vbe
+    call print16
+
+    ; Default: VBE failed
+    mov word [VBE_MAGIC_ADDR], 0x0000
+
+    ; Ensure ES=0 for VBE calls (ES:DI buffer addressing)
+    xor ax, ax
+    mov es, ax
+
+    ; Get VBE controller info (to find the supported mode list)
+    mov dword [VBE_CTRL_ADDR], 'VBE2'   ; Request VBE 2.0+ info
+    mov ax, 0x4F00
+    mov di, VBE_CTRL_ADDR
+    int 0x10
+    cmp ax, 0x004F
+    jne .vbe_failed
+
+    ; Read mode list pointer (far pointer at offset 14 in controller info)
+    ; Format: offset (16-bit) at +14, segment (16-bit) at +16
+    mov si, [VBE_CTRL_ADDR + 14]    ; Mode list offset
+    mov ax, [VBE_CTRL_ADDR + 16]    ; Mode list segment
+    mov fs, ax                       ; FS:SI = mode list
+
+    ; Best mode tracking: prefer highest resolution at 32bpp
+    mov word [.vbe_best], 0xFFFF     ; No best mode yet
+    mov dword [.vbe_best_pixels], 0  ; Best resolution = 0 pixels
+
+.vbe_scan:
+    mov cx, [fs:si]                  ; Read mode number
+    cmp cx, 0xFFFF
+    je .vbe_scan_done                ; End of list
+    add si, 2                        ; Advance to next mode
+
+    mov [.vbe_current], cx
+
+    ; Get mode info
+    push si
+    push fs
+    xor ax, ax
+    mov es, ax
+    mov di, VBE_INFO_ADDR
+    mov ax, 0x4F01
+    int 0x10
+    pop fs
+    pop si
+
+    cmp ax, 0x004F
+    jne .vbe_scan                    ; Skip invalid modes
+
+    ; Check: must have linear framebuffer (attribute bit 7)
+    mov ax, [VBE_INFO_ADDR]
+    test ax, (1 << 7)
+    jz .vbe_scan
+
+    ; Check: must be 32bpp
+    mov al, [VBE_INFO_ADDR + 25]
+    cmp al, 32
+    jne .vbe_scan
+
+    ; Check: width must be >= 640 and <= 1920
+    mov ax, [VBE_INFO_ADDR + 18]     ; width
+    cmp ax, 640
+    jb .vbe_scan
+    cmp ax, 1920
+    ja .vbe_scan
+
+    ; Check: height must be >= 480 and <= 1200
+    mov bx, [VBE_INFO_ADDR + 20]     ; height
+    cmp bx, 480
+    jb .vbe_scan
+    cmp bx, 1200
+    ja .vbe_scan
+
+    ; Calculate pixels (width * height) — compare with best
+    ; Use 32-bit multiply: AX * BX -> DX:AX
+    mul bx                           ; DX:AX = width * height
+    ; Compare with best (simple: just compare AX if DX==0 for < 64K*64K)
+    cmp eax, [.vbe_best_pixels]
+    jbe .vbe_scan                    ; Not better than current best
+
+    ; This is our new best mode
+    mov [.vbe_best_pixels], eax
+    mov cx, [.vbe_current]
+    mov [.vbe_best], cx
+    jmp .vbe_scan
+
+.vbe_scan_done:
+    ; Do we have a valid mode?
+    cmp word [.vbe_best], 0xFFFF
+    je .vbe_failed
+
+    ; Re-query mode info for the best mode (need it in buffer for kernel)
+    xor ax, ax
+    mov es, ax
+    mov cx, [.vbe_best]
+    mov di, VBE_INFO_ADDR
+    mov ax, 0x4F01
+    int 0x10
+
+    ; Set the mode with LFB bit
+    mov bx, [.vbe_best]
+    or bx, 0x4000
+    mov ax, 0x4F02
+    int 0x10
+    cmp ax, 0x004F
+    jne .vbe_failed
+
+    ; VBE success!
+    mov word [VBE_MAGIC_ADDR], 0x1EAF
+    jmp .vbe_done
+
+.vbe_current:     dw 0
+.vbe_best:        dw 0xFFFF
+.vbe_best_pixels: dd 0
+
+.vbe_failed:
+    ; Stay in text mode — kernel will fall back to VGA text
+
+.vbe_done:
+
+    ; =====================================================================
+    ; Step 6: Enter 32-bit protected mode
     ; =====================================================================
     cli                         ; Disable interrupts for mode switch
     lgdt [gdt32_ptr]            ; Load 32-bit GDT
@@ -257,6 +397,7 @@ msg_no_cpuid:   db "ERROR: No CPUID support", 13, 10, 0
 msg_no_lm:      db "ERROR: CPU lacks long mode", 13, 10, 0
 msg_lm_ok:      db "  Long mode: supported", 13, 10, 0
 msg_a20_ok:     db "  A20 line: enabled", 13, 10, 0
+msg_vbe:        db "  VBE graphics... ", 0
 
 ; =============================================================================
 ; 32-bit GDT (temporary, used only for the real→protected transition)
@@ -307,7 +448,7 @@ protected_mode_entry:
     out dx, al
 
     ; =====================================================================
-    ; Step 6: Copy kernel from 0x10000 to 0x100000 (1MB)
+    ; Step 7: Copy kernel from 0x10000 to 0x100000 (1MB)
     ; =====================================================================
     cld
     mov esi, 0x10000            ; Source: temporary load address
@@ -316,7 +457,7 @@ protected_mode_entry:
     rep movsd
 
     ; =====================================================================
-    ; Step 7: Set up identity-mapped page tables
+    ; Step 8: Set up identity-mapped page tables
     ; =====================================================================
     ; We need 4-level paging for long mode:
     ;   PML4 (at 0x1000) → PDPT (at 0x2000) → PD (at 0x3000)
@@ -347,7 +488,7 @@ protected_mode_entry:
     mov dword [0x300C], 0x00000000
 
     ; =====================================================================
-    ; Step 8: Enable long mode and paging
+    ; Step 9: Enable long mode and paging
     ; =====================================================================
 
     ; Load PML4 base address into CR3
@@ -429,7 +570,7 @@ long_mode_entry:
     out dx, al
 
     ; =====================================================================
-    ; Step 9: Jump to kernel at 0x100000
+    ; Step 10: Jump to kernel at 0x100000
     ; =====================================================================
     mov rax, KERNEL_FINAL_ADDR
     jmp rax

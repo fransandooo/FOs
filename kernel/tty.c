@@ -1,20 +1,15 @@
 #include "tty.h"
 #include "serial.h"
 #include "io.h"
+#include "console.h"
 #include <stdint.h>
 
 /*
- * VGA Text Mode Driver
+ * TTY Output Dispatcher
  *
- * The VGA text buffer is a memory-mapped I/O region at physical address
- * 0xB8000. It's an 80x25 grid of 16-bit entries:
- *
- *   Bits 0-7  : ASCII character code
- *   Bits 8-11 : Foreground color
- *   Bits 12-14: Background color
- *   Bit  15   : Blink (or bright background, depending on VGA config)
- *
- * Color 0x0F = white on black (our default).
+ * Routes character output to either VGA text mode (0xB8000) or the
+ * framebuffer console, depending on which display mode is active.
+ * Serial output is always echoed regardless of display mode.
  */
 
 #define VGA_ADDRESS  0xB8000
@@ -25,12 +20,13 @@
 static volatile uint16_t *vga = (volatile uint16_t *)VGA_ADDRESS;
 static int col = 0;
 static int row = 0;
+static int graphics_mode = 0;   /* 0 = VGA text, 1 = framebuffer console */
 
 static uint16_t make_entry(char c, uint8_t color) {
     return (uint16_t)c | ((uint16_t)color << 8);
 }
 
-/* Update the hardware cursor position via VGA CRT controller */
+/* Update VGA hardware cursor position */
 static void update_cursor(void) {
     uint16_t pos = row * VGA_WIDTH + col;
     outb(0x3D4, 0x0F);
@@ -39,22 +35,16 @@ static void update_cursor(void) {
     outb(0x3D5, (uint8_t)((pos >> 8) & 0xFF));
 }
 
-/* Scroll the screen up by one line */
-static void scroll(void) {
-    /* Move all rows up by one */
-    for (int i = 0; i < (VGA_HEIGHT - 1) * VGA_WIDTH; i++) {
+/* Scroll VGA text buffer up by one line */
+static void vga_scroll(void) {
+    for (int i = 0; i < (VGA_HEIGHT - 1) * VGA_WIDTH; i++)
         vga[i] = vga[i + VGA_WIDTH];
-    }
-    /* Clear the last row */
-    for (int i = 0; i < VGA_WIDTH; i++) {
+    for (int i = 0; i < VGA_WIDTH; i++)
         vga[(VGA_HEIGHT - 1) * VGA_WIDTH + i] = make_entry(' ', VGA_COLOR);
-    }
 }
 
-void tty_putchar(char c) {
-    /* Also echo to serial port for headless debugging */
-    serial_putchar(c);
-
+/* Write character to VGA text buffer */
+static void vga_putchar(char c) {
     if (c == '\n') {
         col = 0;
         row++;
@@ -66,25 +56,30 @@ void tty_putchar(char c) {
             vga[row * VGA_WIDTH + col] = make_entry(' ', VGA_COLOR);
         }
     } else if (c == '\t') {
-        col = (col + 8) & ~7;   /* Align to next 8-column boundary */
+        col = (col + 8) & ~7;
     } else {
         vga[row * VGA_WIDTH + col] = make_entry(c, VGA_COLOR);
         col++;
     }
 
-    /* Wrap at end of line */
     if (col >= VGA_WIDTH) {
         col = 0;
         row++;
     }
-
-    /* Scroll if we've gone past the bottom */
     if (row >= VGA_HEIGHT) {
-        scroll();
+        vga_scroll();
         row = VGA_HEIGHT - 1;
     }
-
     update_cursor();
+}
+
+void tty_putchar(char c) {
+    serial_putchar(c);
+
+    if (graphics_mode)
+        console_putchar(c);
+    else
+        vga_putchar(c);
 }
 
 void tty_print(const char *str) {
@@ -93,14 +88,22 @@ void tty_print(const char *str) {
 }
 
 void tty_clear(void) {
-    for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) {
-        vga[i] = make_entry(' ', VGA_COLOR);
+    if (graphics_mode) {
+        console_clear();
+    } else {
+        for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++)
+            vga[i] = make_entry(' ', VGA_COLOR);
+        col = 0;
+        row = 0;
+        update_cursor();
     }
-    col = 0;
-    row = 0;
-    update_cursor();
 }
 
 void tty_init(void) {
+    graphics_mode = 0;
     tty_clear();
+}
+
+void tty_set_graphics(void) {
+    graphics_mode = 1;
 }
