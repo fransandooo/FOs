@@ -48,7 +48,7 @@ kmain() — kernel/kmain.c
 | `0x04000 - 0x07BFF`   | Free (stack grows ↓ from 0x7C00) |
 | `0x07C00 - 0x07DFF`   | Stage 1 (MBR, 512 bytes)       |
 | `0x07E00 - 0x09DFF`   | Stage 2 (8KB)                  |
-| `0x10000 - 0x17FFF`   | Kernel temp load (32KB max)    |
+| `0x10000 - 0x1FFFF`   | Kernel temp load (64KB max, raised from 32KB in Phase 2) |
 | `0xB8000 - 0xB8F9F`   | VGA text buffer (80×25×2)      |
 | `0x100000+`           | Kernel (final location)        |
 | `↓ from 0x200000`     | Kernel stack (grows down)      |
